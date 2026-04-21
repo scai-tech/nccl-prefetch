@@ -98,6 +98,12 @@ If your site requires partition/account flags, pass them at submit time:
 $ sbatch -p <partition> -A <account> scripts/simple_l2_prefetch_sweep.sbatch
 ```
 
+For a compile-only smoke check before spending on the full sweep:
+
+```shell
+$ sbatch -t 00:20:00 --export=ALL,BUILD_ONLY=1 scripts/simple_l2_prefetch_sweep.sbatch
+```
+
 ## Copyright
 
 All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.

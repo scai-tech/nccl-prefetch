@@ -174,6 +174,15 @@ sbatch \
   scripts/simple_l2_prefetch_sweep.sbatch
 ```
 
+For a cheap compile-only validation before running the full sweep:
+
+```bash
+sbatch \
+  -t 00:20:00 \
+  --export=ALL,BUILD_ONLY=1,VANILLA_REPO=/path/to/vanilla/nccl,NCCL_TESTS_HOME=/path/to/nccl-tests \
+  scripts/simple_l2_prefetch_sweep.sbatch
+```
+
 The script also writes:
 
 - `comparison_oop_busbw.tsv`

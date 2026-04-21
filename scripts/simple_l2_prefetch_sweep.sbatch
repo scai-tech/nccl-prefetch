@@ -68,6 +68,7 @@ NCCL_TEST_ARGS="${NCCL_TEST_ARGS:-}"
 NCCL_PROTO_FORCE="${NCCL_PROTO_FORCE:-Simple}"
 NCCL_ALGO_FORCE="${NCCL_ALGO_FORCE:-Ring}"
 SRUN_PREFIX="${SRUN_PREFIX:-srun --ntasks=1}"
+BUILD_ONLY="${BUILD_ONLY:-0}"
 
 mkdir -p "$RESULT_ROOT"
 
@@ -88,6 +89,7 @@ echo "TEST_WARMUP_ITERS=$TEST_WARMUP_ITERS TEST_ITERS=$TEST_ITERS"
 echo "NCCL_PROTO_FORCE=$NCCL_PROTO_FORCE NCCL_ALGO_FORCE=$NCCL_ALGO_FORCE"
 echo "NCCL_TEST_ARGS=$NCCL_TEST_ARGS"
 echo "SRUN_PREFIX=$SRUN_PREFIX"
+echo "BUILD_ONLY=$BUILD_ONLY"
 
 require_repo() {
   local path="$1"
@@ -280,6 +282,14 @@ build_nccl "$VANILLA_REPO" "vanilla"
 build_nccl "$EXPERIMENT_REPO" "experiment"
 build_nccl_tests_if_needed
 require_file "$NCCL_TEST_BIN" "all_reduce_perf"
+
+if [[ "$BUILD_ONLY" == "1" ]]; then
+  echo
+  echo "Build-only mode complete."
+  echo "vanilla and experiment NCCL builds succeeded."
+  echo "nccl-tests binary: $NCCL_TEST_BIN"
+  exit 0
+fi
 
 run_case "$VANILLA_REPO" vanilla_baseline 0 0
 run_case "$EXPERIMENT_REPO" experiment_off 0 0
