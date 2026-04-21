@@ -20,6 +20,7 @@ class Primitives<
     T, RedOp, Fan, Direct, ProtoSimple<SlicePerChunk, StepPerSlice, Unroll, MultimemSrcs, MultimemDsts>, P2p, isNetOffload
   > {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
+  static constexpr uint32_t SimpleL2PrefetchMinBytes = 64u << 10;
   static constexpr int Input=0, Output=1;
   static constexpr int RoleInput = 0x01,
                        RoleOutput = 0x02,
@@ -91,6 +92,46 @@ class Primitives<
       int name = 15-group - (nworkers!=nthreads ? 1 : 0);
       return barrier_red_or(vote, name, nworkers);
     }
+  }
+
+  __device__ __forceinline__ void prefetchL2Global(void const* ptr, uint32_t bytes) {
+    #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::
+        "l"(cvta_to_global((char*)ptr)), "r"(bytes) : "memory");
+    #else
+    (void)ptr;
+    (void)bytes;
+    #endif
+  }
+
+  __device__ __forceinline__ void prefetchSimpleSliceTail(void* src, int workSize, int nSrcs) {
+    #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
+    if (tid != 0 || nSrcs != 1 || src == nullptr) return;
+    if (!ncclShmem.comm.simpleL2PrefetchEnable) return;
+
+    size_t workBytes = size_t(workSize) * sizeof(T);
+    if (workBytes < SimpleL2PrefetchMinBytes) return;
+
+    size_t maxPrefetchBytes = size_t(ncclShmem.comm.simpleL2PrefetchMaxBytes);
+    size_t prefetchBytes = workBytes/2 < maxPrefetchBytes ? workBytes/2 : maxPrefetchBytes;
+    if (prefetchBytes < SimpleL2PrefetchMinBytes) return;
+
+    char* sliceStart = (char*)src;
+    // Only prefetch the tail of the current valid slice. Do not touch future
+    // slices because recv FIFO contents may not be producer-visible yet.
+    char* prefetchStart = alignUp(sliceStart + (workBytes - prefetchBytes), 16);
+    char* sliceEnd = alignDown(sliceStart + workBytes, 16);
+    if (sliceEnd <= prefetchStart) return;
+
+    size_t alignedBytes = size_t(sliceEnd - prefetchStart);
+    if (alignedBytes == 0 || alignedBytes > UINT32_MAX) return;
+
+    prefetchL2Global(prefetchStart, (uint32_t)alignedBytes);
+    #else
+    (void)src;
+    (void)workSize;
+    (void)nSrcs;
+    #endif
   }
 
   inline __device__ uint64_t loadStepValue(uint64_t* ptr) {
@@ -243,6 +284,9 @@ class Primitives<
           ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
           // Sync here to make sure all workers are reading from the updated srcs)
           subBarrier();
+        }
+        if (workSize != 0) {
+          prefetchSimpleSliceTail(ncclShmem.groups[group].srcs[0], workSize, Recv * fan.nrecv() + Src);
         }
 
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]

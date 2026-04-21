@@ -58,6 +58,8 @@ NCCL_PARAM(CheckPointers, "CHECK_POINTERS", 0);
 NCCL_PARAM(CommBlocking, "COMM_BLOCKING", NCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(RuntimeConnect, "RUNTIME_CONNECT", 1);
 NCCL_PARAM(WinEnable, "WIN_ENABLE", 1);
+NCCL_PARAM(SimpleL2Prefetch, "SIMPLE_L2_PREFETCH", 0);
+NCCL_PARAM(SimpleL2PrefetchMaxBytes, "SIMPLE_L2_PREFETCH_MAX_BYTES", 512*1024);
 NCCL_PARAM(CollnetEnable, "COLLNET_ENABLE", NCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NvlsChannels, "NVLS_NCHANNELS", NCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NumRmaCtx, "NUM_RMA_CTX", NCCL_CONFIG_UNDEF_INT);
@@ -571,6 +573,7 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   struct ncclKernelCommAndChannels *devCommAndChans = NULL;
   struct ncclNvmlCCStatus ccStatus;
   bool ccEnable;
+  int64_t simpleL2PrefetchMaxBytes;
   cudaStream_t deviceStream;
 
   memset(&tmpCommAndChans, '\0', sizeof(tmpCommAndChans));
@@ -590,6 +593,10 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   for (int p=0; p < NCCL_NUM_PROTOCOLS; p++) {
     tmpCommAndChans.comm.buffSizes[p] = comm->buffSizes[p];
   }
+  tmpCommAndChans.comm.simpleL2PrefetchEnable = (comm->cudaArch >= 900) && (ncclParamSimpleL2Prefetch() != 0);
+  simpleL2PrefetchMaxBytes = ncclParamSimpleL2PrefetchMaxBytes();
+  if (simpleL2PrefetchMaxBytes < 0) simpleL2PrefetchMaxBytes = 0;
+  tmpCommAndChans.comm.simpleL2PrefetchMaxBytes = alignDown((uint32_t)std::min<int64_t>(simpleL2PrefetchMaxBytes, UINT32_MAX), 16u);
   tmpCommAndChans.comm.p2pChunkSize = comm->p2pChunkSize;
   tmpCommAndChans.comm.p2pCrossClique = comm->p2pCrossClique;
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];
@@ -3314,4 +3321,3 @@ ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank) {
   *rank = comm->rank;
   return ncclSuccess;
 }
-

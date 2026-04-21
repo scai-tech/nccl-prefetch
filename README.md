@@ -71,6 +71,33 @@ $ make
 $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 ```
 
+## Hopper SIMPLE L2 Prefetch Experiment
+
+This tree includes a Hopper-only SIMPLE protocol experiment that issues
+`cp.async.bulk.prefetch.L2.global` on the tail of the current valid SIMPLE slice
+before `reduceCopy()`.
+
+- full implementation notes: [docs/simple_l2_prefetch.md](docs/simple_l2_prefetch.md)
+- server sweep script: [scripts/simple_l2_prefetch_sweep.sbatch](scripts/simple_l2_prefetch_sweep.sbatch)
+
+Quick start on a SLURM server:
+
+```shell
+$ git pull
+$ sbatch scripts/simple_l2_prefetch_sweep.sbatch
+```
+
+By default the script compares this repo against a sibling vanilla NCCL tree at
+`../nccl`. Override that path with `VANILLA_REPO=/path/to/vanilla/nccl` if needed.
+The SLURM defaults match the referenced H100 benchmark script: `inferno` queue,
+`gts-dmahajan7-paid` account, `4x H100`, and `sm_90` codegen.
+
+If your site requires partition/account flags, pass them at submit time:
+
+```shell
+$ sbatch -p <partition> -A <account> scripts/simple_l2_prefetch_sweep.sbatch
+```
+
 ## Copyright
 
 All source code and accompanying documentation is copyright (c) 2015-2020, NVIDIA CORPORATION. All rights reserved.
