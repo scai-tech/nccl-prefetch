@@ -119,8 +119,8 @@ class Primitives<
     char* sliceStart = (char*)src;
     // Only prefetch the tail of the current valid slice. Do not touch future
     // slices because recv FIFO contents may not be producer-visible yet.
-    char* prefetchStart = alignUp(sliceStart + (workBytes - prefetchBytes), 16);
-    char* sliceEnd = alignDown(sliceStart + workBytes, 16);
+    char* prefetchStart = alignUp(sliceStart + (workBytes - prefetchBytes), size_t(16));
+    char* sliceEnd = alignDown(sliceStart + workBytes, size_t(16));
     if (sliceEnd <= prefetchStart) return;
 
     size_t alignedBytes = size_t(sliceEnd - prefetchStart);
