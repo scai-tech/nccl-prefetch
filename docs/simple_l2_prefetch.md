@@ -1,9 +1,9 @@
 # Hopper Simple Protocol L2 Prefetch
 
 This branch adds a Hopper-only L2 prefetch experiment to the SIMPLE protocol path.
-The goal is to test whether warming the tail of the current SIMPLE slice in L2 can
-reduce global load miss penalty inside `reduceCopy` without introducing the
-synchronization overheads of TMA/shared-memory staging.
+The goal is to test whether chunked intra-slice L2 prefetch can reduce global
+load miss penalty inside `reduceCopy` without introducing the synchronization
+overheads of TMA/shared-memory staging.
 
 ## What Was Implemented
 
@@ -36,7 +36,7 @@ The prefetch is issued in the SIMPLE worker loop in `genericOp()` after:
 3. optional `ncclNetDeviceUnpack(...)`
 4. optional unpack `subBarrier()`
 
-and immediately before `reduceCopy(...)`.
+and then uses a chunked `reduceCopy(...)` loop inside the current slice.
 
 No completion wait, no extra barrier, and no correctness dependency is introduced.
 The instruction is used strictly as a performance hint:
@@ -48,20 +48,22 @@ cp.async.bulk.prefetch.L2.global [srcMem], size;
 ### Prefetch region
 
 The implementation intentionally does **not** prefetch a future slice.
-Instead, it only prefetches the tail of the **current** valid source slice:
+Instead, it splits the **current** valid slice into internal subchunks and, before
+processing subchunk `i`, issues L2 prefetches for subchunk `i+1` on every current
+source pointer:
 
 - `workBytes = workSize * sizeof(T)`
-- `prefetchBytes = min(workBytes / 2, simpleL2PrefetchMaxBytes)`
-- slices below `64KB` are skipped
-- prefetches below `64KB` are skipped
-- start address is aligned up to `16B`
-- end address is aligned down to `16B`
-- size is therefore always a `16B` multiple
+- `chunkBytes = min(workBytes / 2, simpleL2PrefetchMaxBytes)`
+- pipelining is skipped unless the slice is large enough to form at least two
+  `64KB` chunks
+- each prefetched chunk start is aligned up to `16B`
+- each prefetched chunk end is aligned down to `16B`
+- each issued prefetch size is therefore a `16B` multiple
 
 This choice is deliberate. Prefetching a future recv FIFO slice could touch lines
 that are not yet producer-visible and create a stale/coherence risk. Current-slice
-tail prefetch avoids that hazard because `waitPeer()` has already established that
-the current slice is valid.
+subchunk prefetch avoids that hazard because `waitPeer()` has already established
+that the current slice is valid.
 
 ### Scope limitations in this first version
 
@@ -70,12 +72,12 @@ The optimization is deliberately conservative:
 - enabled only for `sm90+`
 - compiled/issued only when `CUDART_VERSION >= 12010`
 - only `tid == 0` issues the prefetch
-- only when `src != nullptr`
-- only when the SIMPLE op has exactly one source (`nSrcs == 1`)
-- no attempt was made to generalize to multi-source all-reduce paths yet
+- only non-null current-slice source pointers are prefetched
+- all current sources in the SIMPLE op are eligible for prefetch
+- future-slice prefetch is still intentionally disabled
 
-This means the implementation is targeted at the safe single-source subset first,
-which is appropriate for a fast validation pass.
+This keeps the optimization within the safe current-slice validity window while
+covering the multi-source reduce paths that dominate Ring/SIMPLE all-reduce.
 
 ## Files Changed
 
@@ -84,7 +86,8 @@ which is appropriate for a fast validation pass.
 - `src/init.cc`
   - adds env vars and copies knob values into `ncclKernelComm`
 - `src/device/prims_simple.h`
-  - adds the Hopper PTX prefetch helper and inserts the call before `reduceCopy`
+  - adds the Hopper PTX prefetch helper and replaces the single `reduceCopy`
+    call with a chunked prefetch/reduce pipeline
 
 ## Verification Performed
 
@@ -198,7 +201,8 @@ If the hint is effective, the likely signals are:
 - lower global load miss penalty inside `reduceCopy`
 - higher L2 hit rate
 - lower DRAM read pressure
-- lower slice time for the affected SIMPLE single-source sub-ops
+- lower slice time for the affected SIMPLE sub-ops, especially multi-source
+  reduce paths
 
 The optimization does **not** reduce store traffic. It is a load-side latency
 hiding experiment.
