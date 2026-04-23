@@ -269,6 +269,16 @@ generate_comparison_tables() {
   } > "$summary_md"
 }
 
+generate_excel_summary() {
+  local xlsx_path="$RESULT_ROOT/simple_l2_prefetch_summary.xlsx"
+  if command -v python3 >/dev/null 2>&1; then
+    echo "[summary] writing Excel workbook: $xlsx_path"
+    python3 "$REPO_ROOT/scripts/simple_l2_prefetch_make_xlsx.py" "$RESULT_ROOT" -o "$xlsx_path"
+  else
+    echo "python3 not found; skipping Excel workbook generation." >&2
+  fi
+}
+
 require_repo "$EXPERIMENT_REPO" "Experiment"
 require_repo "$VANILLA_REPO" "Vanilla"
 require_command make
@@ -313,9 +323,11 @@ run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_256k 1 262144 2
 run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_512k 1 524288 2
 
 generate_comparison_tables
+generate_excel_summary
 
 echo
 echo "Comparison complete."
 echo "Logs and summaries are in $RESULT_ROOT"
 echo "Summary TSV: $RESULT_ROOT/comparison_oop_busbw.tsv"
 echo "Summary MD : $RESULT_ROOT/comparison_oop_busbw.md"
+echo "Summary XLSX: $RESULT_ROOT/simple_l2_prefetch_summary.xlsx"

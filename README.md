@@ -92,6 +92,8 @@ By default the script compares this repo against a sibling vanilla NCCL tree at
 `../nccl`. Override that path with `VANILLA_REPO=/path/to/vanilla/nccl` if needed.
 The SLURM defaults match the referenced H100 benchmark script: `inferno` queue,
 `gts-dmahajan7-paid` account, `4x H100`, and `sm_90` codegen.
+It also writes an Excel workbook at
+`results/simple_l2_prefetch/<jobid>/simple_l2_prefetch_summary.xlsx`.
 
 If your site requires partition/account flags, pass them at submit time:
 

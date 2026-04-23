@@ -203,9 +203,15 @@ The script also writes:
 
 - `comparison_oop_busbw.tsv`
 - `comparison_oop_busbw.md`
+- `simple_l2_prefetch_summary.xlsx`
 
 These files compare out-of-place bus bandwidth by message size across vanilla,
 experiment-off, and the six prefetch sweep points.
+
+The Excel workbook contains separate sheets for the run summary, out-of-place
+bus bandwidth, out-of-place percent deltas versus vanilla, out-of-place time,
+in-place bus bandwidth, and metadata. It is generated with Python standard
+library code only, so it does not require `pandas` or `openpyxl`.
 
 ## Expected Measurement Signals
 
