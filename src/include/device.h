@@ -442,6 +442,7 @@ struct ncclKernelComm {
   int p2pChunkSize;
   int simpleL2PrefetchEnable;
   uint32_t simpleL2PrefetchMaxBytes;
+  int simpleL2PrefetchAheadChunks;
   bool p2pCrossClique;
   int isAllNvlink;
 

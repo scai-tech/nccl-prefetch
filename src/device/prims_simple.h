@@ -107,10 +107,13 @@ class Primitives<
   __device__ __forceinline__ int simplePrefetchChunkSize(int nSrcs, int workSize) {
     #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
     size_t workBytes = size_t(workSize) * sizeof(T);
-    if (!ncclShmem.comm.simpleL2PrefetchEnable || nSrcs <= 0 || workBytes < 2*size_t(SimpleL2PrefetchMinBytes)) return 0;
+    int aheadChunks = ncclShmem.comm.simpleL2PrefetchAheadChunks;
+    if (!ncclShmem.comm.simpleL2PrefetchEnable || nSrcs <= 0 || aheadChunks <= 0) return 0;
+    if (workBytes < size_t(aheadChunks + 1)*size_t(SimpleL2PrefetchMinBytes)) return 0;
 
     size_t maxPrefetchBytes = size_t(ncclShmem.comm.simpleL2PrefetchMaxBytes);
-    size_t chunkBytes = workBytes/2 < maxPrefetchBytes ? workBytes/2 : maxPrefetchBytes;
+    size_t pipelineChunkBytes = workBytes / size_t(aheadChunks + 1);
+    size_t chunkBytes = pipelineChunkBytes < maxPrefetchBytes ? pipelineChunkBytes : maxPrefetchBytes;
     chunkBytes = alignDown(chunkBytes, size_t(16));
     if (chunkBytes < SimpleL2PrefetchMinBytes) return 0;
 
@@ -166,12 +169,20 @@ class Primitives<
 
     void* srcChunkPtrs[MaxRecv + 1];
     void* dstChunkPtrs[MaxSend + 1];
+    int aheadChunks = ncclShmem.comm.simpleL2PrefetchAheadChunks;
+
+    for (int lead=1; lead < aheadChunks; lead++) {
+      int prefetchOffset = lead * chunkSize;
+      if (prefetchOffset < workSize) {
+        prefetchSimpleChunk(srcs, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+      }
+    }
 
     for (int chunkOffset=0; chunkOffset < workSize; chunkOffset += chunkSize) {
       int chunkElts = min(chunkSize, workSize-chunkOffset);
-      int nextOffset = chunkOffset + chunkElts;
-      if (nextOffset < workSize) {
-        prefetchSimpleChunk(srcs, nSrcs, nextOffset, min(chunkSize, workSize-nextOffset));
+      int prefetchOffset = chunkOffset + aheadChunks*chunkSize;
+      if (prefetchOffset < workSize) {
+        prefetchSimpleChunk(srcs, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
       }
       #pragma unroll
       for (int s=0; s < MaxRecv + 1; s++) {

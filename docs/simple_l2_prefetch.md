@@ -9,11 +9,12 @@ overheads of TMA/shared-memory staging.
 
 ### Runtime knobs
 
-Two runtime knobs were added to `ncclKernelComm` and are populated during host
+Three runtime knobs were added to `ncclKernelComm` and are populated during host
 device-comm setup:
 
 - `simpleL2PrefetchEnable`
 - `simpleL2PrefetchMaxBytes`
+- `simpleL2PrefetchAheadChunks`
 
 The corresponding environment variables are:
 
@@ -22,10 +23,15 @@ The corresponding environment variables are:
   - nonzero: enabled
   - default: `0`
 - `NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES`
-  - maximum bytes prefetched from the current slice tail
+  - maximum bytes prefetched per current-slice subchunk
   - default: `512*1024`
   - negative values are clamped to `0`
   - value is aligned down to `16B` before being copied to device state
+- `NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS`
+  - current-slice prefetch lookahead window
+  - default: `1`
+  - values below `1` are clamped to `1`
+  - values above `4` are clamped to `4`
 
 ### Device-side behavior
 
@@ -48,14 +54,15 @@ cp.async.bulk.prefetch.L2.global [srcMem], size;
 ### Prefetch region
 
 The implementation intentionally does **not** prefetch a future slice.
-Instead, it splits the **current** valid slice into internal subchunks and, before
-processing subchunk `i`, issues L2 prefetches for subchunk `i+1` on every current
-source pointer:
+Instead, it splits the **current** valid slice into internal subchunks. With
+`NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=N`, it primes chunks `i+1..i+N` and then,
+before processing subchunk `i`, issues L2 prefetches for subchunk `i+N` on every
+current source pointer:
 
 - `workBytes = workSize * sizeof(T)`
-- `chunkBytes = min(workBytes / 2, simpleL2PrefetchMaxBytes)`
-- pipelining is skipped unless the slice is large enough to form at least two
-  `64KB` chunks
+- `chunkBytes = min(workBytes / (aheadChunks + 1), simpleL2PrefetchMaxBytes)`
+- pipelining is skipped unless the slice is large enough to form at least
+  `aheadChunks + 1` chunks of `64KB`
 - each prefetched chunk start is aligned up to `16B`
 - each prefetched chunk end is aligned down to `16B`
 - each issued prefetch size is therefore a `16B` multiple
@@ -128,9 +135,12 @@ The script does the following:
 4. runs:
    - `vanilla_baseline`
    - `experiment_off`
-   - `experiment_prefetch_128k`
-   - `experiment_prefetch_256k`
-   - `experiment_prefetch_512k`
+   - `experiment_prefetch_a1_128k`
+   - `experiment_prefetch_a1_256k`
+   - `experiment_prefetch_a1_512k`
+   - `experiment_prefetch_a2_128k`
+   - `experiment_prefetch_a2_256k`
+   - `experiment_prefetch_a2_512k`
 5. writes logs and comparison summaries under `results/simple_l2_prefetch/<jobid>/`
 
 If you already have an `all_reduce_perf` binary elsewhere, you can skip the
@@ -150,9 +160,12 @@ The experiment repo defaults to the repo that contains the script.
 Default sweep points:
 
 - baseline: `NCCL_SIMPLE_L2_PREFETCH=0`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=131072`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=262144`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=524288`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=131072`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=262144`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=524288`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=131072`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=262144`
+- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=524288`
 
 ### Example
 
@@ -192,7 +205,7 @@ The script also writes:
 - `comparison_oop_busbw.md`
 
 These files compare out-of-place bus bandwidth by message size across vanilla,
-experiment-off, and the three prefetch sweep points.
+experiment-off, and the six prefetch sweep points.
 
 ## Expected Measurement Signals
 

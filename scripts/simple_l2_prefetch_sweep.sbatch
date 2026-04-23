@@ -164,6 +164,7 @@ run_case() {
   local case_name="$2"
   local enable="$3"
   local max_bytes="$4"
+  local ahead_chunks="${5:-1}"
   local log_file="$RESULT_ROOT/${case_name}.log"
 
   echo
@@ -171,6 +172,7 @@ run_case() {
   echo "  repo=$repo"
   echo "  NCCL_SIMPLE_L2_PREFETCH=$enable"
   echo "  NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=$max_bytes"
+  echo "  NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=$ahead_chunks"
   echo "  log=$log_file"
 
   (
@@ -180,6 +182,7 @@ run_case() {
     export NCCL_ALGO="$NCCL_ALGO_FORCE"
     export NCCL_SIMPLE_L2_PREFETCH="$enable"
     export NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES="$max_bytes"
+    export NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS="$ahead_chunks"
     ${SRUN_PREFIX} "$NCCL_TEST_BIN" \
       -b "$TEST_B" \
       -e "$TEST_E" \
@@ -206,17 +209,23 @@ extract_busbw_table() {
 generate_comparison_tables() {
   local vanilla_tsv="$RESULT_ROOT/vanilla_baseline.tsv"
   local exp_off_tsv="$RESULT_ROOT/experiment_off.tsv"
-  local p128_tsv="$RESULT_ROOT/experiment_prefetch_128k.tsv"
-  local p256_tsv="$RESULT_ROOT/experiment_prefetch_256k.tsv"
-  local p512_tsv="$RESULT_ROOT/experiment_prefetch_512k.tsv"
+  local a1_128_tsv="$RESULT_ROOT/experiment_prefetch_a1_128k.tsv"
+  local a1_256_tsv="$RESULT_ROOT/experiment_prefetch_a1_256k.tsv"
+  local a1_512_tsv="$RESULT_ROOT/experiment_prefetch_a1_512k.tsv"
+  local a2_128_tsv="$RESULT_ROOT/experiment_prefetch_a2_128k.tsv"
+  local a2_256_tsv="$RESULT_ROOT/experiment_prefetch_a2_256k.tsv"
+  local a2_512_tsv="$RESULT_ROOT/experiment_prefetch_a2_512k.tsv"
   local summary_tsv="$RESULT_ROOT/comparison_oop_busbw.tsv"
   local summary_md="$RESULT_ROOT/comparison_oop_busbw.md"
 
   extract_busbw_table "$RESULT_ROOT/vanilla_baseline.log" "$vanilla_tsv"
   extract_busbw_table "$RESULT_ROOT/experiment_off.log" "$exp_off_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_128k.log" "$p128_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_256k.log" "$p256_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_512k.log" "$p512_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_128k.log" "$a1_128_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_256k.log" "$a1_256_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_512k.log" "$a1_512_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_128k.log" "$a2_128_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_256k.log" "$a2_256_tsv"
+  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_512k.log" "$a2_512_tsv"
 
   awk '
     function pct(newv, oldv) {
@@ -225,18 +234,21 @@ generate_comparison_tables() {
     }
     FILENAME==ARGV[1] {van[$1]=$2; sizes[$1]=1; next}
     FILENAME==ARGV[2] {off[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[3] {p128[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[4] {p256[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[5] {p512[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[3] {a1_128[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[4] {a1_256[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[5] {a1_512[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[6] {a2_128[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[7] {a2_256[$1]=$2; sizes[$1]=1; next}
+    FILENAME==ARGV[8] {a2_512[$1]=$2; sizes[$1]=1; next}
     END {
-      print "size_bytes\tvanilla_oop_busbw_gbps\texperiment_off_oop_busbw_gbps\tprefetch_128k_oop_busbw_gbps\tprefetch_256k_oop_busbw_gbps\tprefetch_512k_oop_busbw_gbps\toff_vs_vanilla_pct\tprefetch_128k_vs_vanilla_pct\tprefetch_256k_vs_vanilla_pct\tprefetch_512k_vs_vanilla_pct"
+      print "size_bytes\tvanilla_oop_busbw_gbps\texperiment_off_oop_busbw_gbps\tprefetch_a1_128k_oop_busbw_gbps\tprefetch_a1_256k_oop_busbw_gbps\tprefetch_a1_512k_oop_busbw_gbps\tprefetch_a2_128k_oop_busbw_gbps\tprefetch_a2_256k_oop_busbw_gbps\tprefetch_a2_512k_oop_busbw_gbps\toff_vs_vanilla_pct\tprefetch_a1_128k_vs_vanilla_pct\tprefetch_a1_256k_vs_vanilla_pct\tprefetch_a1_512k_vs_vanilla_pct\tprefetch_a2_128k_vs_vanilla_pct\tprefetch_a2_256k_vs_vanilla_pct\tprefetch_a2_512k_vs_vanilla_pct"
       for (s in sizes) {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
-          s, van[s], off[s], p128[s], p256[s], p512[s], \
-          pct(off[s], van[s]), pct(p128[s], van[s]), pct(p256[s], van[s]), pct(p512[s], van[s])
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+          s, van[s], off[s], a1_128[s], a1_256[s], a1_512[s], a2_128[s], a2_256[s], a2_512[s], \
+          pct(off[s], van[s]), pct(a1_128[s], van[s]), pct(a1_256[s], van[s]), pct(a1_512[s], van[s]), pct(a2_128[s], van[s]), pct(a2_256[s], van[s]), pct(a2_512[s], van[s])
       }
     }
-  ' "$vanilla_tsv" "$exp_off_tsv" "$p128_tsv" "$p256_tsv" "$p512_tsv" > "$summary_tsv.tmp"
+  ' "$vanilla_tsv" "$exp_off_tsv" "$a1_128_tsv" "$a1_256_tsv" "$a1_512_tsv" "$a2_128_tsv" "$a2_256_tsv" "$a2_512_tsv" > "$summary_tsv.tmp"
   {
     head -n 1 "$summary_tsv.tmp"
     tail -n +2 "$summary_tsv.tmp" | sort -n
@@ -248,12 +260,12 @@ generate_comparison_tables() {
     echo
     echo "- vanilla baseline log: \`vanilla_baseline.log\`"
     echo "- experiment off log: \`experiment_off.log\`"
-    echo "- experiment on logs: \`experiment_prefetch_128k.log\`, \`experiment_prefetch_256k.log\`, \`experiment_prefetch_512k.log\`"
+    echo "- experiment on logs: \`experiment_prefetch_a1_*.log\`, \`experiment_prefetch_a2_*.log\`"
     echo "- table source: \`comparison_oop_busbw.tsv\`"
     echo
-    echo "| size_bytes | vanilla | exp_off | p128 | p256 | p512 | off_vs_vanilla_% | p128_vs_vanilla_% | p256_vs_vanilla_% | p512_vs_vanilla_% |"
-    echo "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    awk -F'\t' 'NR>1 {printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10}' "$summary_tsv"
+    echo "| size_bytes | vanilla | exp_off | a1_128 | a1_256 | a1_512 | a2_128 | a2_256 | a2_512 | off_% | a1_128_% | a1_256_% | a1_512_% | a2_128_% | a2_256_% | a2_512_% |"
+    echo "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    awk -F'\t' 'NR>1 {printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16}' "$summary_tsv"
   } > "$summary_md"
 }
 
@@ -291,11 +303,14 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
   exit 0
 fi
 
-run_case "$VANILLA_REPO" vanilla_baseline 0 0
-run_case "$EXPERIMENT_REPO" experiment_off 0 0
-run_case "$EXPERIMENT_REPO" experiment_prefetch_128k 1 131072
-run_case "$EXPERIMENT_REPO" experiment_prefetch_256k 1 262144
-run_case "$EXPERIMENT_REPO" experiment_prefetch_512k 1 524288
+run_case "$VANILLA_REPO" vanilla_baseline 0 0 1
+run_case "$EXPERIMENT_REPO" experiment_off 0 0 1
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_128k 1 131072 1
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_256k 1 262144 1
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_512k 1 524288 1
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_128k 1 131072 2
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_256k 1 262144 2
+run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_512k 1 524288 2
 
 generate_comparison_tables
 
