@@ -76,9 +76,11 @@ $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 This tree includes a Hopper-only SIMPLE protocol experiment that issues
 `cp.async.bulk.prefetch.L2.global` inside the current valid SIMPLE slice with
 chunked intra-slice pipelining before each `reduceCopy()` subchunk. The current
-version also aggressively warms the first chunk and, for local/user-buffer
-sources only, extends the prefetch window into future slices. The server sweep
-tests both 1-chunk and 2-chunk lookahead.
+version also warms the first chunk, distributes prefetch issue across the first
+warp, and lets local/user-buffer sources run a more aggressive future-slice
+pipeline than recv/FIFO-backed sources. The SLURM sweep explores prefetch mode,
+chunk size, future-window budget, and lookahead distance in one job and reports
+the best configurations automatically.
 
 - full implementation notes: [docs/simple_l2_prefetch.md](docs/simple_l2_prefetch.md)
 - server sweep script: [scripts/simple_l2_prefetch_sweep.sbatch](scripts/simple_l2_prefetch_sweep.sbatch)
@@ -96,6 +98,9 @@ The SLURM defaults match the referenced H100 benchmark script: `inferno` queue,
 `gts-dmahajan7-paid` account, `4x H100`, and `sm_90` codegen.
 It also writes an Excel workbook at
 `results/simple_l2_prefetch/<jobid>/simple_l2_prefetch_summary.xlsx`.
+The workbook now includes both a ranked average-bus-bandwidth sheet and a
+best-by-message-size sheet so the best setting can be identified without
+manually scanning `.out` logs.
 
 If your site requires partition/account flags, pass them at submit time:
 

@@ -21,6 +21,9 @@ class Primitives<
   > {
   static constexpr int MaxRecv = Fan::MaxRecv, MaxSend = Fan::MaxSend;
   static constexpr uint32_t SimpleL2PrefetchMinBytes = 64u << 10;
+  static constexpr int SimpleL2PrefetchModeBoth = 0;
+  static constexpr int SimpleL2PrefetchModeRecv = 1;
+  static constexpr int SimpleL2PrefetchModeLocal = 2;
   static constexpr int Input=0, Output=1;
   static constexpr int RoleInput = 0x01,
                        RoleOutput = 0x02,
@@ -104,16 +107,24 @@ class Primitives<
     #endif
   }
 
+  __device__ __forceinline__ bool simplePrefetchRecvEnabled() const {
+    return ncclShmem.comm.simpleL2PrefetchMode != SimpleL2PrefetchModeLocal;
+  }
+
+  __device__ __forceinline__ bool simplePrefetchLocalEnabled() const {
+    return ncclShmem.comm.simpleL2PrefetchMode != SimpleL2PrefetchModeRecv;
+  }
+
   __device__ __forceinline__ int simplePrefetchChunkSize(int nSrcs, int workSize) {
     #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
     size_t workBytes = size_t(workSize) * sizeof(T);
-    int aheadChunks = ncclShmem.comm.simpleL2PrefetchAheadChunks;
-    if (!ncclShmem.comm.simpleL2PrefetchEnable || nSrcs <= 0 || aheadChunks <= 0) return 0;
-    if (workBytes < size_t(aheadChunks + 1)*size_t(SimpleL2PrefetchMinBytes)) return 0;
+    size_t chunkBytes = size_t(ncclShmem.comm.simpleL2PrefetchChunkBytes);
+    if (!ncclShmem.comm.simpleL2PrefetchEnable || nSrcs <= 0) return 0;
+    if (workBytes < 2*size_t(SimpleL2PrefetchMinBytes)) return 0;
 
-    size_t maxPrefetchBytes = size_t(ncclShmem.comm.simpleL2PrefetchMaxBytes);
-    size_t pipelineChunkBytes = workBytes / size_t(aheadChunks + 1);
-    size_t chunkBytes = pipelineChunkBytes < maxPrefetchBytes ? pipelineChunkBytes : maxPrefetchBytes;
+    chunkBytes = alignDown(chunkBytes, size_t(16));
+    if (chunkBytes == 0) return 0;
+    if (chunkBytes >= workBytes) chunkBytes = alignDown(workBytes/2, size_t(16));
     chunkBytes = alignDown(chunkBytes, size_t(16));
     if (chunkBytes < SimpleL2PrefetchMinBytes) return 0;
 
@@ -126,14 +137,34 @@ class Primitives<
     #endif
   }
 
+  __device__ __forceinline__ int simplePrefetchFutureLocalElts(int futureLocalElts) const {
+    #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
+    if (!ncclShmem.comm.simpleL2PrefetchEnable || !simplePrefetchLocalEnabled() || futureLocalElts <= 0) return 0;
+
+    size_t budgetBytes = alignDown(size_t(ncclShmem.comm.simpleL2PrefetchMaxBytes), size_t(16));
+    if (budgetBytes < SimpleL2PrefetchMinBytes) return 0;
+
+    size_t futureBytes = size_t(futureLocalElts) * sizeof(T);
+    if (futureBytes < SimpleL2PrefetchMinBytes) return 0;
+
+    budgetBytes = budgetBytes < futureBytes ? budgetBytes : futureBytes;
+    int budgetElts = int(budgetBytes / sizeof(T));
+    return budgetElts > 0 ? budgetElts : 0;
+    #else
+    (void)futureLocalElts;
+    return 0;
+    #endif
+  }
+
   __device__ __forceinline__ void prefetchSimpleChunkRange(void** srcs, int srcBeg, int srcEnd, int chunkOffset, int chunkElts) {
     #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
-    if (tid != 0 || !ncclShmem.comm.simpleL2PrefetchEnable || chunkElts <= 0) return;
+    int prefetchThreads = nworkers < WARP_SIZE ? nworkers : WARP_SIZE;
+    if (!ncclShmem.comm.simpleL2PrefetchEnable || chunkElts <= 0 || tid >= prefetchThreads) return;
 
     size_t chunkBytes = size_t(chunkElts) * sizeof(T);
     if (chunkBytes < SimpleL2PrefetchMinBytes) return;
 
-    for (int s=srcBeg; s < srcEnd; s++) {
+    for (int s=srcBeg + tid; s < srcEnd; s += prefetchThreads) {
       if (srcs[s] == nullptr) continue;
       char* chunkStart = (char*)((T*)srcs[s] + chunkOffset);
       char* prefetchStart = alignUp(chunkStart, size_t(16));
@@ -154,6 +185,21 @@ class Primitives<
     #endif
   }
 
+  __device__ __forceinline__ void prefetchSimpleCurrentChunks(void** srcs, int nSrcs, int nLocalSrcs, int chunkOffset, int chunkElts) {
+    if (chunkElts <= 0) return;
+    if (simplePrefetchLocalEnabled() && nLocalSrcs > 0) {
+      prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, chunkOffset, chunkElts);
+    }
+    if (simplePrefetchRecvEnabled() && nLocalSrcs < nSrcs) {
+      prefetchSimpleChunkRange(srcs, nLocalSrcs, nSrcs, chunkOffset, chunkElts);
+    }
+  }
+
+  __device__ __forceinline__ void prefetchSimpleFutureLocalChunks(void** srcs, int nLocalSrcs, int chunkOffset, int chunkElts) {
+    if (!simplePrefetchLocalEnabled() || nLocalSrcs <= 0 || chunkElts <= 0) return;
+    prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, chunkOffset, chunkElts);
+  }
+
   template<int RcMultimemSrcs, int RcMinSrcs, int RcMaxSrcs,
            int RcMultimemDsts, int RcMinDsts, int RcMaxDsts, int PreOpSrcs>
   __device__ __forceinline__ void reduceCopyPipelined(
@@ -172,24 +218,24 @@ class Primitives<
     void* srcChunkPtrs[MaxRecv + 1];
     void* dstChunkPtrs[MaxSend + 1];
     int aheadChunks = ncclShmem.comm.simpleL2PrefetchAheadChunks;
-    int currentPrimeElts = min(chunkSize, workSize);
+    int futureLocalBudgetElts = simplePrefetchFutureLocalElts(futureLocalElts);
 
     // Warm-start the current slice so chunk 0 does not begin completely cold.
-    prefetchSimpleChunkRange(srcs, 0, nSrcs, 0, currentPrimeElts);
+    prefetchSimpleCurrentChunks(srcs, nSrcs, nLocalSrcs, 0, min(chunkSize, workSize));
 
     for (int lead=1; lead <= aheadChunks; lead++) {
       int prefetchOffset = lead * chunkSize;
       if (prefetchOffset < workSize) {
-        prefetchSimpleChunkRange(srcs, 0, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+        prefetchSimpleCurrentChunks(srcs, nSrcs, nLocalSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
       }
     }
 
     // User/local sources are coherent and contiguous, so we can aggressively
     // extend the pipeline window beyond the current slice boundary.
-    if (nLocalSrcs > 0 && futureLocalElts > 0) {
-      int futurePrimeElts = min(futureLocalElts, aheadChunks*chunkSize);
+    if (futureLocalBudgetElts > 0) {
+      int futurePrimeElts = min(futureLocalBudgetElts, (aheadChunks + 1)*chunkSize);
       for (int futureOffset=0; futureOffset < futurePrimeElts; futureOffset += chunkSize) {
-        prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, workSize + futureOffset, min(chunkSize, futurePrimeElts-futureOffset));
+        prefetchSimpleFutureLocalChunks(srcs, nLocalSrcs, workSize + futureOffset, min(chunkSize, futurePrimeElts-futureOffset));
       }
     }
 
@@ -197,12 +243,13 @@ class Primitives<
       int chunkElts = min(chunkSize, workSize-chunkOffset);
       int prefetchOffset = chunkOffset + (aheadChunks + 1)*chunkSize;
       if (prefetchOffset < workSize) {
-        prefetchSimpleChunkRange(srcs, 0, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+        prefetchSimpleCurrentChunks(srcs, nSrcs, nLocalSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
       }
-      if (nLocalSrcs > 0) {
+      if (futureLocalBudgetElts > 0) {
         int futurePrefetchOffset = workSize + chunkOffset + aheadChunks*chunkSize;
-        if (futurePrefetchOffset < workSize + futureLocalElts) {
-          prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, futurePrefetchOffset, min(chunkSize, workSize + futureLocalElts - futurePrefetchOffset));
+        int futureWindowEnd = workSize + futureLocalBudgetElts;
+        if (futurePrefetchOffset < futureWindowEnd) {
+          prefetchSimpleFutureLocalChunks(srcs, nLocalSrcs, futurePrefetchOffset, min(chunkSize, futureWindowEnd - futurePrefetchOffset));
         }
       }
       #pragma unroll

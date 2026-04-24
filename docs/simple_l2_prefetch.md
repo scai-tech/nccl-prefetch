@@ -9,12 +9,14 @@ overheads of TMA/shared-memory staging.
 
 ### Runtime knobs
 
-Three runtime knobs were added to `ncclKernelComm` and are populated during host
+Five runtime knobs were added to `ncclKernelComm` and are populated during host
 device-comm setup:
 
 - `simpleL2PrefetchEnable`
 - `simpleL2PrefetchMaxBytes`
+- `simpleL2PrefetchChunkBytes`
 - `simpleL2PrefetchAheadChunks`
+- `simpleL2PrefetchMode`
 
 The corresponding environment variables are:
 
@@ -23,8 +25,13 @@ The corresponding environment variables are:
   - nonzero: enabled
   - default: `0`
 - `NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES`
-  - maximum bytes prefetched per current-slice subchunk
+  - maximum bytes of future local/user-buffer lookahead kept prefetched ahead of the current slice
   - default: `512*1024`
+  - negative values are clamped to `0`
+  - value is aligned down to `16B` before being copied to device state
+- `NCCL_SIMPLE_L2_PREFETCH_CHUNK_BYTES`
+  - current-slice subchunk size used by the prefetch/reduce pipeline
+  - default: `128*1024`
   - negative values are clamped to `0`
   - value is aligned down to `16B` before being copied to device state
 - `NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS`
@@ -32,6 +39,12 @@ The corresponding environment variables are:
   - default: `1`
   - values below `1` are clamped to `1`
   - values above `4` are clamped to `4`
+- `NCCL_SIMPLE_L2_PREFETCH_MODE`
+  - `0`: prefetch both recv and local sources
+  - `1`: prefetch recv sources only
+  - `2`: prefetch local sources only
+  - default: `0`
+  - values are clamped into `[0, 2]`
 
 ### Device-side behavior
 
@@ -53,7 +66,7 @@ cp.async.bulk.prefetch.L2.global [srcMem], size;
 
 ### Prefetch region
 
-The implementation now uses two aggressive but source-aware rules:
+The implementation now uses source-aware rules:
 
 - for **recv/FIFO-backed sources**, it stays within the **current valid slice**
 - for **local/user-buffer sources**, it also prefetches a **future contiguous
@@ -62,13 +75,15 @@ The implementation now uses two aggressive but source-aware rules:
 Inside the current slice, it splits the work into internal subchunks. With
 `NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=N`, it first warms chunk `0`, primes
 chunks `1..N`, and then, before processing subchunk `i`, issues L2 prefetches
-for subchunk `i+N+1` on every current source pointer. In parallel, local
-sources maintain a rolling future-slice prefetch window:
+for subchunk `i+N+1`. The prefetch issue itself is distributed across the first
+worker warp instead of a single `tid == 0` issuer. In parallel, local sources
+maintain a rolling future-slice prefetch window:
 
 - `workBytes = workSize * sizeof(T)`
-- `chunkBytes = min(workBytes / (aheadChunks + 1), simpleL2PrefetchMaxBytes)`
+- `chunkBytes = simpleL2PrefetchChunkBytes`
+- future local lookahead budget is capped by `simpleL2PrefetchMaxBytes`
 - pipelining is skipped unless the current slice is large enough to form at
-  least `aheadChunks + 1` chunks of `64KB`
+  least two `64KB` chunks
 - each prefetched chunk start is aligned up to `16B`
 - each prefetched chunk end is aligned down to `16B`
 - each issued prefetch size is therefore a `16B` multiple
@@ -85,10 +100,10 @@ The optimization is deliberately conservative:
 
 - enabled only for `sm90+`
 - compiled/issued only when `CUDART_VERSION >= 12010`
-- only `tid == 0` issues the prefetch
+- only the first worker warp issues the prefetch
 - only non-null source pointers are prefetched
-- all current sources in the SIMPLE op are eligible for prefetch
-- future-slice prefetch is limited to local/user-buffer sources
+- current-slice prefetch can be restricted to recv-only, local-only, or both
+- future-slice prefetch is still limited to local/user-buffer sources
 
 This keeps recv-side accesses within the safe current-slice validity window while
 still creating a deeper inter-slice pipeline for local sources.
@@ -139,15 +154,14 @@ The script does the following:
 1. builds a vanilla NCCL tree and this experiment tree
 2. builds `nccl-tests` if needed
 3. forces `NCCL_PROTO=Simple`
-4. runs:
+4. runs a full grid:
    - `vanilla_baseline`
    - `experiment_off`
-   - `experiment_prefetch_a1_128k`
-   - `experiment_prefetch_a1_256k`
-   - `experiment_prefetch_a1_512k`
-   - `experiment_prefetch_a2_128k`
-   - `experiment_prefetch_a2_256k`
-   - `experiment_prefetch_a2_512k`
+   - `experiment_prefetch_mode_<mode>_chunk_<chunk>k_max_<max>k_ahead_<ahead>`
+   - default mode sweep: `both,local,recv`
+   - default chunk sweep: `64KB,128KB,256KB`
+   - default future-window sweep: `128KB,256KB,512KB`
+   - default lookahead sweep: `1,2,4`
 5. writes logs and comparison summaries under `results/simple_l2_prefetch/<jobid>/`
 
 If you already have an `all_reduce_perf` binary elsewhere, you can skip the
@@ -164,15 +178,12 @@ If your vanilla tree lives elsewhere, pass:
 
 The experiment repo defaults to the repo that contains the script.
 
-Default sweep points:
+Default sweep controls:
 
-- baseline: `NCCL_SIMPLE_L2_PREFETCH=0`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=131072`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=262144`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=1 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=524288`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=131072`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=262144`
-- `NCCL_SIMPLE_L2_PREFETCH=1 NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=2 NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=524288`
+- `PREFETCH_MODES_CSV=both,local,recv`
+- `PREFETCH_CHUNK_BYTES_CSV=65536,131072,262144`
+- `PREFETCH_MAX_BYTES_CSV=131072,262144,524288`
+- `PREFETCH_AHEAD_CHUNKS_CSV=1,2,4`
 
 ### Example
 
@@ -213,11 +224,12 @@ The script also writes:
 - `simple_l2_prefetch_summary.xlsx`
 
 These files compare out-of-place bus bandwidth by message size across vanilla,
-experiment-off, and the six prefetch sweep points.
+experiment-off, and every prefetched sweep point in the generated grid.
 
-The Excel workbook contains separate sheets for the run summary, out-of-place
-bus bandwidth, out-of-place percent deltas versus vanilla, out-of-place time,
-in-place bus bandwidth, and metadata. It is generated with Python standard
+The Excel workbook contains separate sheets for the run summary, ranked average
+results, out-of-place bus bandwidth, out-of-place percent deltas versus vanilla,
+out-of-place time, in-place bus bandwidth, best-by-size, and metadata. It is
+generated with Python standard
 library code only, so it does not require `pandas` or `openpyxl`.
 
 ## Expected Measurement Signals

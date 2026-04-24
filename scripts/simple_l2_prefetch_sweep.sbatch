@@ -64,6 +64,10 @@ TEST_F="${TEST_F:-2}"
 TEST_WARMUP_ITERS="${TEST_WARMUP_ITERS:-100}"
 TEST_ITERS="${TEST_ITERS:-3000}"
 NCCL_TEST_ARGS="${NCCL_TEST_ARGS:-}"
+PREFETCH_MODES_CSV="${PREFETCH_MODES_CSV:-both,local,recv}"
+PREFETCH_CHUNK_BYTES_CSV="${PREFETCH_CHUNK_BYTES_CSV:-65536,131072,262144}"
+PREFETCH_MAX_BYTES_CSV="${PREFETCH_MAX_BYTES_CSV:-131072,262144,524288}"
+PREFETCH_AHEAD_CHUNKS_CSV="${PREFETCH_AHEAD_CHUNKS_CSV:-1,2,4}"
 
 NCCL_PROTO_FORCE="${NCCL_PROTO_FORCE:-Simple}"
 NCCL_ALGO_FORCE="${NCCL_ALGO_FORCE:-Ring}"
@@ -86,6 +90,10 @@ echo "NCCL_TEST_BUILD_REPO=$NCCL_TEST_BUILD_REPO"
 echo "NCCL_TEST_GPUS=$NCCL_TEST_GPUS"
 echo "TEST_B=$TEST_B TEST_E=$TEST_E TEST_F=$TEST_F"
 echo "TEST_WARMUP_ITERS=$TEST_WARMUP_ITERS TEST_ITERS=$TEST_ITERS"
+echo "PREFETCH_MODES_CSV=$PREFETCH_MODES_CSV"
+echo "PREFETCH_CHUNK_BYTES_CSV=$PREFETCH_CHUNK_BYTES_CSV"
+echo "PREFETCH_MAX_BYTES_CSV=$PREFETCH_MAX_BYTES_CSV"
+echo "PREFETCH_AHEAD_CHUNKS_CSV=$PREFETCH_AHEAD_CHUNKS_CSV"
 echo "NCCL_PROTO_FORCE=$NCCL_PROTO_FORCE NCCL_ALGO_FORCE=$NCCL_ALGO_FORCE"
 echo "NCCL_TEST_ARGS=$NCCL_TEST_ARGS"
 echo "SRUN_PREFIX=$SRUN_PREFIX"
@@ -165,6 +173,8 @@ run_case() {
   local enable="$3"
   local max_bytes="$4"
   local ahead_chunks="${5:-1}"
+  local chunk_bytes="${6:-0}"
+  local mode_value="${7:-0}"
   local log_file="$RESULT_ROOT/${case_name}.log"
 
   echo
@@ -173,6 +183,8 @@ run_case() {
   echo "  NCCL_SIMPLE_L2_PREFETCH=$enable"
   echo "  NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES=$max_bytes"
   echo "  NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=$ahead_chunks"
+  echo "  NCCL_SIMPLE_L2_PREFETCH_CHUNK_BYTES=$chunk_bytes"
+  echo "  NCCL_SIMPLE_L2_PREFETCH_MODE=$mode_value"
   echo "  log=$log_file"
 
   (
@@ -183,6 +195,8 @@ run_case() {
     export NCCL_SIMPLE_L2_PREFETCH="$enable"
     export NCCL_SIMPLE_L2_PREFETCH_MAX_BYTES="$max_bytes"
     export NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS="$ahead_chunks"
+    export NCCL_SIMPLE_L2_PREFETCH_CHUNK_BYTES="$chunk_bytes"
+    export NCCL_SIMPLE_L2_PREFETCH_MODE="$mode_value"
     ${SRUN_PREFIX} "$NCCL_TEST_BIN" \
       -b "$TEST_B" \
       -e "$TEST_E" \
@@ -194,88 +208,33 @@ run_case() {
   ) 2>&1 | tee "$log_file"
 }
 
-extract_busbw_table() {
-  local log_file="$1"
-  local out_file="$2"
-  awk '
-    /^[[:space:]]*[0-9]+[[:space:]]+/ {
-      if (NF >= 12) {
-        print $1 "\t" $8 "\t" $12
-      }
-    }
-  ' "$log_file" > "$out_file"
+split_csv() {
+  local csv="$1"
+  local -n out_ref="$2"
+  IFS=',' read -r -a out_ref <<< "$csv"
 }
 
-generate_comparison_tables() {
-  local vanilla_tsv="$RESULT_ROOT/vanilla_baseline.tsv"
-  local exp_off_tsv="$RESULT_ROOT/experiment_off.tsv"
-  local a1_128_tsv="$RESULT_ROOT/experiment_prefetch_a1_128k.tsv"
-  local a1_256_tsv="$RESULT_ROOT/experiment_prefetch_a1_256k.tsv"
-  local a1_512_tsv="$RESULT_ROOT/experiment_prefetch_a1_512k.tsv"
-  local a2_128_tsv="$RESULT_ROOT/experiment_prefetch_a2_128k.tsv"
-  local a2_256_tsv="$RESULT_ROOT/experiment_prefetch_a2_256k.tsv"
-  local a2_512_tsv="$RESULT_ROOT/experiment_prefetch_a2_512k.tsv"
-  local summary_tsv="$RESULT_ROOT/comparison_oop_busbw.tsv"
-  local summary_md="$RESULT_ROOT/comparison_oop_busbw.md"
-
-  extract_busbw_table "$RESULT_ROOT/vanilla_baseline.log" "$vanilla_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_off.log" "$exp_off_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_128k.log" "$a1_128_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_256k.log" "$a1_256_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a1_512k.log" "$a1_512_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_128k.log" "$a2_128_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_256k.log" "$a2_256_tsv"
-  extract_busbw_table "$RESULT_ROOT/experiment_prefetch_a2_512k.log" "$a2_512_tsv"
-
-  awk '
-    function pct(newv, oldv) {
-      if (oldv == 0 || oldv == "") return "nan"
-      return sprintf("%.2f", 100.0*(newv-oldv)/oldv)
-    }
-    FILENAME==ARGV[1] {van[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[2] {off[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[3] {a1_128[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[4] {a1_256[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[5] {a1_512[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[6] {a2_128[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[7] {a2_256[$1]=$2; sizes[$1]=1; next}
-    FILENAME==ARGV[8] {a2_512[$1]=$2; sizes[$1]=1; next}
-    END {
-      print "size_bytes\tvanilla_oop_busbw_gbps\texperiment_off_oop_busbw_gbps\tprefetch_a1_128k_oop_busbw_gbps\tprefetch_a1_256k_oop_busbw_gbps\tprefetch_a1_512k_oop_busbw_gbps\tprefetch_a2_128k_oop_busbw_gbps\tprefetch_a2_256k_oop_busbw_gbps\tprefetch_a2_512k_oop_busbw_gbps\toff_vs_vanilla_pct\tprefetch_a1_128k_vs_vanilla_pct\tprefetch_a1_256k_vs_vanilla_pct\tprefetch_a1_512k_vs_vanilla_pct\tprefetch_a2_128k_vs_vanilla_pct\tprefetch_a2_256k_vs_vanilla_pct\tprefetch_a2_512k_vs_vanilla_pct"
-      for (s in sizes) {
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", \
-          s, van[s], off[s], a1_128[s], a1_256[s], a1_512[s], a2_128[s], a2_256[s], a2_512[s], \
-          pct(off[s], van[s]), pct(a1_128[s], van[s]), pct(a1_256[s], van[s]), pct(a1_512[s], van[s]), pct(a2_128[s], van[s]), pct(a2_256[s], van[s]), pct(a2_512[s], van[s])
-      }
-    }
-  ' "$vanilla_tsv" "$exp_off_tsv" "$a1_128_tsv" "$a1_256_tsv" "$a1_512_tsv" "$a2_128_tsv" "$a2_256_tsv" "$a2_512_tsv" > "$summary_tsv.tmp"
-  {
-    head -n 1 "$summary_tsv.tmp"
-    tail -n +2 "$summary_tsv.tmp" | sort -n
-  } > "$summary_tsv"
-  rm -f "$summary_tsv.tmp"
-
-  {
-    echo "# SIMPLE L2 Prefetch Comparison (Out-of-Place BusBW)"
-    echo
-    echo "- vanilla baseline log: \`vanilla_baseline.log\`"
-    echo "- experiment off log: \`experiment_off.log\`"
-    echo "- experiment on logs: \`experiment_prefetch_a1_*.log\`, \`experiment_prefetch_a2_*.log\`"
-    echo "- table source: \`comparison_oop_busbw.tsv\`"
-    echo
-    echo "| size_bytes | vanilla | exp_off | a1_128 | a1_256 | a1_512 | a2_128 | a2_256 | a2_512 | off_% | a1_128_% | a1_256_% | a1_512_% | a2_128_% | a2_256_% | a2_512_% |"
-    echo "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    awk -F'\t' 'NR>1 {printf "| %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16}' "$summary_tsv"
-  } > "$summary_md"
+mode_to_env() {
+  case "$1" in
+    both) echo 0 ;;
+    recv) echo 1 ;;
+    local) echo 2 ;;
+    *)
+      echo "Unsupported prefetch mode: $1" >&2
+      exit 1
+      ;;
+  esac
 }
 
-generate_excel_summary() {
+generate_reports() {
   local xlsx_path="$RESULT_ROOT/simple_l2_prefetch_summary.xlsx"
+  local tsv_path="$RESULT_ROOT/comparison_oop_busbw.tsv"
+  local md_path="$RESULT_ROOT/comparison_oop_busbw.md"
   if command -v python3 >/dev/null 2>&1; then
-    echo "[summary] writing Excel workbook: $xlsx_path"
-    python3 "$REPO_ROOT/scripts/simple_l2_prefetch_make_xlsx.py" "$RESULT_ROOT" -o "$xlsx_path"
+    echo "[summary] writing reports under: $RESULT_ROOT"
+    python3 "$REPO_ROOT/scripts/simple_l2_prefetch_make_xlsx.py" "$RESULT_ROOT" -o "$xlsx_path" --tsv "$tsv_path" --md "$md_path"
   else
-    echo "python3 not found; skipping Excel workbook generation." >&2
+    echo "python3 not found; skipping report generation." >&2
   fi
 }
 
@@ -313,17 +272,27 @@ if [[ "$BUILD_ONLY" == "1" ]]; then
   exit 0
 fi
 
-run_case "$VANILLA_REPO" vanilla_baseline 0 0 1
-run_case "$EXPERIMENT_REPO" experiment_off 0 0 1
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_128k 1 131072 1
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_256k 1 262144 1
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a1_512k 1 524288 1
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_128k 1 131072 2
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_256k 1 262144 2
-run_case "$EXPERIMENT_REPO" experiment_prefetch_a2_512k 1 524288 2
+split_csv "$PREFETCH_MODES_CSV" PREFETCH_MODES
+split_csv "$PREFETCH_CHUNK_BYTES_CSV" PREFETCH_CHUNK_BYTES
+split_csv "$PREFETCH_MAX_BYTES_CSV" PREFETCH_MAX_BYTES
+split_csv "$PREFETCH_AHEAD_CHUNKS_CSV" PREFETCH_AHEAD_CHUNKS
 
-generate_comparison_tables
-generate_excel_summary
+run_case "$VANILLA_REPO" vanilla_baseline 0 0 1 0 0
+run_case "$EXPERIMENT_REPO" experiment_off 0 0 1 0 0
+
+for mode_label in "${PREFETCH_MODES[@]}"; do
+  mode_value="$(mode_to_env "$mode_label")"
+  for chunk_bytes in "${PREFETCH_CHUNK_BYTES[@]}"; do
+    for max_bytes in "${PREFETCH_MAX_BYTES[@]}"; do
+      for ahead_chunks in "${PREFETCH_AHEAD_CHUNKS[@]}"; do
+        case_name="experiment_prefetch_mode_${mode_label}_chunk_$((chunk_bytes/1024))k_max_$((max_bytes/1024))k_ahead_${ahead_chunks}"
+        run_case "$EXPERIMENT_REPO" "$case_name" 1 "$max_bytes" "$ahead_chunks" "$chunk_bytes" "$mode_value"
+      done
+    done
+  done
+done
+
+generate_reports
 
 echo
 echo "Comparison complete."

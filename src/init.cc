@@ -60,7 +60,9 @@ NCCL_PARAM(RuntimeConnect, "RUNTIME_CONNECT", 1);
 NCCL_PARAM(WinEnable, "WIN_ENABLE", 1);
 NCCL_PARAM(SimpleL2Prefetch, "SIMPLE_L2_PREFETCH", 0);
 NCCL_PARAM(SimpleL2PrefetchMaxBytes, "SIMPLE_L2_PREFETCH_MAX_BYTES", 512*1024);
+NCCL_PARAM(SimpleL2PrefetchChunkBytes, "SIMPLE_L2_PREFETCH_CHUNK_BYTES", 128*1024);
 NCCL_PARAM(SimpleL2PrefetchAheadChunks, "SIMPLE_L2_PREFETCH_AHEAD_CHUNKS", 1);
+NCCL_PARAM(SimpleL2PrefetchMode, "SIMPLE_L2_PREFETCH_MODE", 0);
 NCCL_PARAM(CollnetEnable, "COLLNET_ENABLE", NCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NvlsChannels, "NVLS_NCHANNELS", NCCL_CONFIG_UNDEF_INT);
 NCCL_PARAM(NumRmaCtx, "NUM_RMA_CTX", NCCL_CONFIG_UNDEF_INT);
@@ -575,7 +577,9 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   struct ncclNvmlCCStatus ccStatus;
   bool ccEnable;
   int64_t simpleL2PrefetchMaxBytes;
+  int64_t simpleL2PrefetchChunkBytes;
   int64_t simpleL2PrefetchAheadChunks;
+  int64_t simpleL2PrefetchMode;
   cudaStream_t deviceStream;
 
   memset(&tmpCommAndChans, '\0', sizeof(tmpCommAndChans));
@@ -599,10 +603,17 @@ static ncclResult_t devCommSetup(ncclComm_t comm) {
   simpleL2PrefetchMaxBytes = ncclParamSimpleL2PrefetchMaxBytes();
   if (simpleL2PrefetchMaxBytes < 0) simpleL2PrefetchMaxBytes = 0;
   tmpCommAndChans.comm.simpleL2PrefetchMaxBytes = alignDown((uint32_t)std::min<int64_t>(simpleL2PrefetchMaxBytes, UINT32_MAX), 16u);
+  simpleL2PrefetchChunkBytes = ncclParamSimpleL2PrefetchChunkBytes();
+  if (simpleL2PrefetchChunkBytes < 0) simpleL2PrefetchChunkBytes = 0;
+  tmpCommAndChans.comm.simpleL2PrefetchChunkBytes = alignDown((uint32_t)std::min<int64_t>(simpleL2PrefetchChunkBytes, UINT32_MAX), 16u);
   simpleL2PrefetchAheadChunks = ncclParamSimpleL2PrefetchAheadChunks();
   if (simpleL2PrefetchAheadChunks < 1) simpleL2PrefetchAheadChunks = 1;
   if (simpleL2PrefetchAheadChunks > 4) simpleL2PrefetchAheadChunks = 4;
   tmpCommAndChans.comm.simpleL2PrefetchAheadChunks = (int)simpleL2PrefetchAheadChunks;
+  simpleL2PrefetchMode = ncclParamSimpleL2PrefetchMode();
+  if (simpleL2PrefetchMode < 0) simpleL2PrefetchMode = 0;
+  if (simpleL2PrefetchMode > 2) simpleL2PrefetchMode = 2;
+  tmpCommAndChans.comm.simpleL2PrefetchMode = (int)simpleL2PrefetchMode;
   tmpCommAndChans.comm.p2pChunkSize = comm->p2pChunkSize;
   tmpCommAndChans.comm.p2pCrossClique = comm->p2pCrossClique;
   tmpCommAndChans.comm.channels = &devCommAndChans->channels[0];

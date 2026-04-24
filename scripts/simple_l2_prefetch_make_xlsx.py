@@ -8,36 +8,89 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 
-CASE_ORDER = [
-    "vanilla_baseline",
-    "experiment_off",
-    "experiment_prefetch_a1_128k",
-    "experiment_prefetch_a1_256k",
-    "experiment_prefetch_a1_512k",
-    "experiment_prefetch_a2_128k",
-    "experiment_prefetch_a2_256k",
-    "experiment_prefetch_a2_512k",
-]
+MODE_ORDER = {"off": 0, "both": 1, "local": 2, "recv": 3}
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Create an Excel summary from SIMPLE L2 prefetch logs.")
+    parser = argparse.ArgumentParser(description="Create TSV/Markdown/Excel summaries from SIMPLE L2 prefetch logs.")
     parser.add_argument("result_dir", type=Path, help="Result directory containing *.log files")
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output .xlsx path")
+    parser.add_argument("--tsv", type=Path, default=None, help="Output comparison TSV path")
+    parser.add_argument("--md", type=Path, default=None, help="Output comparison Markdown path")
     return parser.parse_args()
 
 
 def case_config(name):
     if name == "vanilla_baseline":
-        return "vanilla", 0, 0, 1
+      return {
+          "repo": "vanilla",
+          "prefetch": 0,
+          "mode": "off",
+          "chunk_bytes": 0,
+          "max_bytes": 0,
+          "ahead_chunks": 1,
+      }
     if name == "experiment_off":
-        return "experiment", 0, 0, 1
+      return {
+          "repo": "experiment",
+          "prefetch": 0,
+          "mode": "off",
+          "chunk_bytes": 0,
+          "max_bytes": 0,
+          "ahead_chunks": 1,
+      }
+
+    match = re.match(
+        r"experiment_prefetch_mode_([a-z]+)_chunk_([0-9]+)k_max_([0-9]+)k_ahead_([0-9]+)$",
+        name,
+    )
+    if match:
+        return {
+            "repo": "experiment",
+            "prefetch": 1,
+            "mode": match.group(1),
+            "chunk_bytes": int(match.group(2)) * 1024,
+            "max_bytes": int(match.group(3)) * 1024,
+            "ahead_chunks": int(match.group(4)),
+        }
+
+    # Backward compatibility with older sweep names.
     match = re.match(r"experiment_prefetch_a([0-9]+)_([0-9]+)k$", name)
     if match:
         ahead = int(match.group(1))
         max_bytes = int(match.group(2)) * 1024
-        return "experiment", 1, max_bytes, ahead
-    return "unknown", "", "", ""
+        return {
+            "repo": "experiment",
+            "prefetch": 1,
+            "mode": "both",
+            "chunk_bytes": max_bytes,
+            "max_bytes": max_bytes,
+            "ahead_chunks": ahead,
+        }
+
+    return {
+        "repo": "unknown",
+        "prefetch": "",
+        "mode": "",
+        "chunk_bytes": "",
+        "max_bytes": "",
+        "ahead_chunks": "",
+    }
+
+
+def case_sort_key(name):
+    config = case_config(name)
+    if name == "vanilla_baseline":
+        return (0, 0, 0, 0, 0)
+    if name == "experiment_off":
+        return (1, 0, 0, 0, 0)
+    return (
+        2,
+        MODE_ORDER.get(config["mode"], 99),
+        config["chunk_bytes"] if isinstance(config["chunk_bytes"], int) else 0,
+        config["max_bytes"] if isinstance(config["max_bytes"], int) else 0,
+        config["ahead_chunks"] if isinstance(config["ahead_chunks"], int) else 0,
+    )
 
 
 def parse_log(path):
@@ -87,34 +140,46 @@ def percent_delta(new, old):
 
 
 def collect_cases(result_dir):
+    found = []
+    for path in result_dir.glob("*.log"):
+        found.append(path.stem)
+    names = sorted(set(found), key=case_sort_key)
+
     cases = {}
-    for name in CASE_ORDER:
+    for name in names:
         path = result_dir / f"{name}.log"
-        if path.exists():
-            cases[name] = parse_log(path)
-            cases[name]["log"] = path.name
-            cases[name]["config"] = case_config(name)
-    extra_logs = sorted(p for p in result_dir.glob("*.log") if p.stem not in cases)
-    for path in extra_logs:
-        cases[path.stem] = parse_log(path)
-        cases[path.stem]["log"] = path.name
-        cases[path.stem]["config"] = case_config(path.stem)
+        data = parse_log(path)
+        data["log"] = path.name
+        data["config"] = case_config(name)
+        cases[name] = data
     return cases
+
+
+def all_sizes(cases):
+    sizes = set()
+    for data in cases.values():
+        sizes.update(data["rows"].keys())
+    return sorted(sizes)
 
 
 def build_summary(cases):
     vanilla = cases.get("vanilla_baseline", {}).get("avg_busbw")
     exp_off = cases.get("experiment_off", {}).get("avg_busbw")
-    rows = [["case", "repo", "prefetch", "ahead_chunks", "max_bytes", "avg_busbw_gbps", "vs_vanilla_pct", "vs_experiment_off_pct", "log"]]
+    rows = [[
+        "case", "repo", "prefetch", "mode", "chunk_bytes", "max_bytes",
+        "ahead_chunks", "avg_busbw_gbps", "vs_vanilla_pct", "vs_experiment_off_pct", "log",
+    ]]
     for name, data in cases.items():
-        repo, enable, max_bytes, ahead = data["config"]
+        config = data["config"]
         avg = data.get("avg_busbw")
         rows.append([
             name,
-            repo,
-            enable,
-            ahead,
-            max_bytes,
+            config["repo"],
+            config["prefetch"],
+            config["mode"],
+            config["chunk_bytes"],
+            config["max_bytes"],
+            config["ahead_chunks"],
             avg,
             percent_delta(avg, vanilla),
             percent_delta(avg, exp_off),
@@ -123,11 +188,38 @@ def build_summary(cases):
     return rows
 
 
-def all_sizes(cases):
-    sizes = set()
-    for data in cases.values():
-        sizes.update(data["rows"].keys())
-    return sorted(sizes)
+def build_ranked_summary(cases):
+    vanilla = cases.get("vanilla_baseline", {}).get("avg_busbw")
+    exp_off = cases.get("experiment_off", {}).get("avg_busbw")
+    ranked = sorted(
+        cases.items(),
+        key=lambda item: (
+            item[1].get("avg_busbw") is not None,
+            item[1].get("avg_busbw") if item[1].get("avg_busbw") is not None else float("-inf"),
+        ),
+        reverse=True,
+    )
+    rows = [[
+        "rank", "case", "repo", "prefetch", "mode", "chunk_bytes", "max_bytes",
+        "ahead_chunks", "avg_busbw_gbps", "vs_vanilla_pct", "vs_experiment_off_pct",
+    ]]
+    for idx, (name, data) in enumerate(ranked, start=1):
+        config = data["config"]
+        avg = data.get("avg_busbw")
+        rows.append([
+            idx,
+            name,
+            config["repo"],
+            config["prefetch"],
+            config["mode"],
+            config["chunk_bytes"],
+            config["max_bytes"],
+            config["ahead_chunks"],
+            avg,
+            percent_delta(avg, vanilla),
+            percent_delta(avg, exp_off),
+        ])
+    return rows
 
 
 def build_metric_sheet(cases, metric, title):
@@ -168,6 +260,26 @@ def build_delta_sheet(cases):
     return rows
 
 
+def build_best_by_size(cases):
+    sizes = all_sizes(cases)
+    names = list(cases.keys())
+    vanilla = cases.get("vanilla_baseline", {})
+    rows = [["size_bytes", "size_mib", "best_case", "best_oop_busbw_gbps", "best_vs_vanilla_pct"]]
+    for size in sizes:
+        best_name = ""
+        best_value = None
+        for name in names:
+            value = cases[name]["rows"].get(size, {}).get("oop_busbw_gbps")
+            if value is None:
+                continue
+            if best_value is None or value > best_value:
+                best_name = name
+                best_value = value
+        base = vanilla.get("rows", {}).get(size, {}).get("oop_busbw_gbps")
+        rows.append([size, size / (1024.0 * 1024.0), best_name, best_value, percent_delta(best_value, base)])
+    return rows
+
+
 def build_metadata(result_dir, cases):
     rows = [
         ["field", "value"],
@@ -178,6 +290,59 @@ def build_metadata(result_dir, cases):
     for name, data in cases.items():
         rows.append([f"{name}_nccl", data.get("nccl_line", "")])
     return rows
+
+
+def write_comparison_tsv(tsv_path, cases):
+    sizes = all_sizes(cases)
+    names = list(cases.keys())
+    vanilla = cases.get("vanilla_baseline", {})
+    header = ["size_bytes", "size_mib"] + [f"{name}_oop_busbw_gbps" for name in names] + ["best_case", "best_oop_busbw_gbps", "best_vs_vanilla_pct"]
+    with tsv_path.open("w", encoding="utf-8") as f:
+        f.write("\t".join(header) + "\n")
+        for size in sizes:
+            values = [cases[name]["rows"].get(size, {}).get("oop_busbw_gbps") for name in names]
+            best_name = ""
+            best_value = None
+            for name, value in zip(names, values):
+                if value is None:
+                    continue
+                if best_value is None or value > best_value:
+                    best_name = name
+                    best_value = value
+            base = vanilla.get("rows", {}).get(size, {}).get("oop_busbw_gbps")
+            row = [size, size / (1024.0 * 1024.0)] + values + [best_name, best_value, percent_delta(best_value, base)]
+            f.write("\t".join("" if value is None else str(value) for value in row) + "\n")
+
+
+def write_comparison_md(md_path, cases):
+    summary = build_summary(cases)
+    ranked = build_ranked_summary(cases)
+    best_by_size = build_best_by_size(cases)
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write("# SIMPLE L2 Prefetch Comparison\n\n")
+        f.write("## Average BusBW Ranking\n\n")
+        f.write("| rank | case | mode | chunk_bytes | max_bytes | ahead | avg_busbw | vs_vanilla_% | vs_exp_off_% |\n")
+        f.write("| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+        for row in ranked[1:11]:
+            f.write(
+                f"| {row[0]} | {row[1]} | {row[4]} | {row[5]} | {row[6]} | {row[7]} | "
+                f"{'' if row[8] is None else row[8]} | {'' if row[9] is None else row[9]} | {'' if row[10] is None else row[10]} |\n"
+            )
+
+        f.write("\n## Baseline Averages\n\n")
+        f.write("| case | avg_busbw | log |\n")
+        f.write("| --- | ---: | --- |\n")
+        for row in summary[1:3]:
+            f.write(f"| {row[0]} | {'' if row[7] is None else row[7]} | {row[10]} |\n")
+
+        f.write("\n## Best By Size\n\n")
+        f.write("| size_bytes | size_mib | best_case | best_oop_busbw | best_vs_vanilla_% |\n")
+        f.write("| ---: | ---: | --- | ---: | ---: |\n")
+        for row in best_by_size[1:]:
+            f.write(
+                f"| {row[0]} | {row[1]} | {row[2]} | "
+                f"{'' if row[3] is None else row[3]} | {'' if row[4] is None else row[4]} |\n"
+            )
 
 
 def col_name(index):
@@ -326,18 +491,26 @@ def write_xlsx(path, sheets):
 def main():
     args = parse_args()
     result_dir = args.result_dir.resolve()
-    output = args.output or (result_dir / "simple_l2_prefetch_summary.xlsx")
+    output = (args.output or (result_dir / "simple_l2_prefetch_summary.xlsx")).resolve()
+    tsv_path = (args.tsv or (result_dir / "comparison_oop_busbw.tsv")).resolve()
+    md_path = (args.md or (result_dir / "comparison_oop_busbw.md")).resolve()
     cases = collect_cases(result_dir)
     if not cases:
         raise SystemExit(f"No log files found under {result_dir}")
 
+    write_comparison_tsv(tsv_path, cases)
+    write_comparison_md(md_path, cases)
+
     summary = build_summary(cases)
+    ranked = build_ranked_summary(cases)
     sheets = [
-        ("Summary", summary, {7, 8}),
+        ("Summary", summary, {9, 10}),
+        ("Ranked", ranked, {10, 11}),
         build_metric_sheet(cases, "oop_busbw_gbps", "OOP_BusBW") + (set(),),
         ("OOP_DeltaPct", build_delta_sheet(cases), set(range(3, 3 + max(len(cases) - 1, 0)))),
         build_metric_sheet(cases, "oop_time_us", "OOP_Time_us") + (set(),),
         build_metric_sheet(cases, "ip_busbw_gbps", "IP_BusBW") + (set(),),
+        ("Best_By_Size", build_best_by_size(cases), {5}),
         ("Metadata", build_metadata(result_dir, cases), set()),
     ]
     write_xlsx(output, sheets)
