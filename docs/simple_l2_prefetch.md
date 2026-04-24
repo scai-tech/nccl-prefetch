@@ -53,24 +53,31 @@ cp.async.bulk.prefetch.L2.global [srcMem], size;
 
 ### Prefetch region
 
-The implementation intentionally does **not** prefetch a future slice.
-Instead, it splits the **current** valid slice into internal subchunks. With
-`NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=N`, it primes chunks `i+1..i+N` and then,
-before processing subchunk `i`, issues L2 prefetches for subchunk `i+N` on every
-current source pointer:
+The implementation now uses two aggressive but source-aware rules:
+
+- for **recv/FIFO-backed sources**, it stays within the **current valid slice**
+- for **local/user-buffer sources**, it also prefetches a **future contiguous
+  window beyond the current slice boundary**
+
+Inside the current slice, it splits the work into internal subchunks. With
+`NCCL_SIMPLE_L2_PREFETCH_AHEAD_CHUNKS=N`, it first warms chunk `0`, primes
+chunks `1..N`, and then, before processing subchunk `i`, issues L2 prefetches
+for subchunk `i+N+1` on every current source pointer. In parallel, local
+sources maintain a rolling future-slice prefetch window:
 
 - `workBytes = workSize * sizeof(T)`
 - `chunkBytes = min(workBytes / (aheadChunks + 1), simpleL2PrefetchMaxBytes)`
-- pipelining is skipped unless the slice is large enough to form at least
-  `aheadChunks + 1` chunks of `64KB`
+- pipelining is skipped unless the current slice is large enough to form at
+  least `aheadChunks + 1` chunks of `64KB`
 - each prefetched chunk start is aligned up to `16B`
 - each prefetched chunk end is aligned down to `16B`
 - each issued prefetch size is therefore a `16B` multiple
 
-This choice is deliberate. Prefetching a future recv FIFO slice could touch lines
+This split is deliberate. Prefetching a future recv FIFO slice could touch lines
 that are not yet producer-visible and create a stale/coherence risk. Current-slice
-subchunk prefetch avoids that hazard because `waitPeer()` has already established
-that the current slice is valid.
+recv prefetch avoids that hazard because `waitPeer()` has already established
+that the current slice is valid. Local/user-buffer sources do not have that
+producer-visibility problem, so they can be prefetched more aggressively.
 
 ### Scope limitations in this first version
 
@@ -79,12 +86,12 @@ The optimization is deliberately conservative:
 - enabled only for `sm90+`
 - compiled/issued only when `CUDART_VERSION >= 12010`
 - only `tid == 0` issues the prefetch
-- only non-null current-slice source pointers are prefetched
+- only non-null source pointers are prefetched
 - all current sources in the SIMPLE op are eligible for prefetch
-- future-slice prefetch is still intentionally disabled
+- future-slice prefetch is limited to local/user-buffer sources
 
-This keeps the optimization within the safe current-slice validity window while
-covering the multi-source reduce paths that dominate Ring/SIMPLE all-reduce.
+This keeps recv-side accesses within the safe current-slice validity window while
+still creating a deeper inter-slice pipeline for local sources.
 
 ## Files Changed
 

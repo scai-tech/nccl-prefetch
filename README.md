@@ -75,8 +75,10 @@ $ ./build/all_reduce_perf -b 8 -e 256M -f 2 -g <ngpus>
 
 This tree includes a Hopper-only SIMPLE protocol experiment that issues
 `cp.async.bulk.prefetch.L2.global` inside the current valid SIMPLE slice with
-chunked intra-slice pipelining before each `reduceCopy()` subchunk. The server
-sweep tests both 1-chunk and 2-chunk lookahead.
+chunked intra-slice pipelining before each `reduceCopy()` subchunk. The current
+version also aggressively warms the first chunk and, for local/user-buffer
+sources only, extends the prefetch window into future slices. The server sweep
+tests both 1-chunk and 2-chunk lookahead.
 
 - full implementation notes: [docs/simple_l2_prefetch.md](docs/simple_l2_prefetch.md)
 - server sweep script: [scripts/simple_l2_prefetch_sweep.sbatch](scripts/simple_l2_prefetch_sweep.sbatch)

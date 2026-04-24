@@ -126,14 +126,14 @@ class Primitives<
     #endif
   }
 
-  __device__ __forceinline__ void prefetchSimpleChunk(void** srcs, int nSrcs, int chunkOffset, int chunkElts) {
+  __device__ __forceinline__ void prefetchSimpleChunkRange(void** srcs, int srcBeg, int srcEnd, int chunkOffset, int chunkElts) {
     #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
     if (tid != 0 || !ncclShmem.comm.simpleL2PrefetchEnable || chunkElts <= 0) return;
 
     size_t chunkBytes = size_t(chunkElts) * sizeof(T);
     if (chunkBytes < SimpleL2PrefetchMinBytes) return;
 
-    for (int s=0; s < nSrcs; s++) {
+    for (int s=srcBeg; s < srcEnd; s++) {
       if (srcs[s] == nullptr) continue;
       char* chunkStart = (char*)((T*)srcs[s] + chunkOffset);
       char* prefetchStart = alignUp(chunkStart, size_t(16));
@@ -146,8 +146,9 @@ class Primitives<
       prefetchL2Global(prefetchStart, (uint32_t)alignedBytes);
     }
     #else
-    (void)nSrcs;
     (void)srcs;
+    (void)srcBeg;
+    (void)srcEnd;
     (void)chunkOffset;
     (void)chunkElts;
     #endif
@@ -156,7 +157,8 @@ class Primitives<
   template<int RcMultimemSrcs, int RcMinSrcs, int RcMaxSrcs,
            int RcMultimemDsts, int RcMinDsts, int RcMaxDsts, int PreOpSrcs>
   __device__ __forceinline__ void reduceCopyPipelined(
-      uint64_t redArg, bool postOp, int nSrcs, void** srcs, int nDsts, void** dsts, int workSize
+      uint64_t redArg, bool postOp, int nSrcs, int nLocalSrcs, int futureLocalElts,
+      void** srcs, int nDsts, void** dsts, int workSize
     ) {
     int chunkSize = simplePrefetchChunkSize(nSrcs, workSize);
     if (chunkSize == 0) {
@@ -170,19 +172,38 @@ class Primitives<
     void* srcChunkPtrs[MaxRecv + 1];
     void* dstChunkPtrs[MaxSend + 1];
     int aheadChunks = ncclShmem.comm.simpleL2PrefetchAheadChunks;
+    int currentPrimeElts = min(chunkSize, workSize);
 
-    for (int lead=1; lead < aheadChunks; lead++) {
+    // Warm-start the current slice so chunk 0 does not begin completely cold.
+    prefetchSimpleChunkRange(srcs, 0, nSrcs, 0, currentPrimeElts);
+
+    for (int lead=1; lead <= aheadChunks; lead++) {
       int prefetchOffset = lead * chunkSize;
       if (prefetchOffset < workSize) {
-        prefetchSimpleChunk(srcs, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+        prefetchSimpleChunkRange(srcs, 0, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+      }
+    }
+
+    // User/local sources are coherent and contiguous, so we can aggressively
+    // extend the pipeline window beyond the current slice boundary.
+    if (nLocalSrcs > 0 && futureLocalElts > 0) {
+      int futurePrimeElts = min(futureLocalElts, aheadChunks*chunkSize);
+      for (int futureOffset=0; futureOffset < futurePrimeElts; futureOffset += chunkSize) {
+        prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, workSize + futureOffset, min(chunkSize, futurePrimeElts-futureOffset));
       }
     }
 
     for (int chunkOffset=0; chunkOffset < workSize; chunkOffset += chunkSize) {
       int chunkElts = min(chunkSize, workSize-chunkOffset);
-      int prefetchOffset = chunkOffset + aheadChunks*chunkSize;
+      int prefetchOffset = chunkOffset + (aheadChunks + 1)*chunkSize;
       if (prefetchOffset < workSize) {
-        prefetchSimpleChunk(srcs, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+        prefetchSimpleChunkRange(srcs, 0, nSrcs, prefetchOffset, min(chunkSize, workSize-prefetchOffset));
+      }
+      if (nLocalSrcs > 0) {
+        int futurePrefetchOffset = workSize + chunkOffset + aheadChunks*chunkSize;
+        if (futurePrefetchOffset < workSize + futureLocalElts) {
+          prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, futurePrefetchOffset, min(chunkSize, workSize + futureLocalElts - futurePrefetchOffset));
+        }
       }
       #pragma unroll
       for (int s=0; s < MaxRecv + 1; s++) {
@@ -350,6 +371,7 @@ class Primitives<
           // Sync here to make sure all workers are reading from the updated srcs)
           subBarrier();
         }
+        int futureLocalElts = workSize == 0 ? 0 : max(0, nelem - (offset + workSize));
 
         if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
             /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
@@ -358,16 +380,16 @@ class Primitives<
           // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
           if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
             reduceCopyPipelined<0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
-              (/*redArg*/0, /*postOp*/false,
-               1, ncclShmem.groups[group].srcs,
+              (/*redArg*/0, /*postOp*/false, 1, 0, 0,
+               ncclShmem.groups[group].srcs,
                fan.nsend(), ncclShmem.groups[group].dsts+1,
                workSize);
           }
         } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
           // For broadcast in CollNet to do empty send
           reduceCopyPipelined<0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
-            (ncclShmem.groups[group].redOpArgs, postOp,
-             Recv, ncclShmem.groups[group].srcs,
+            (ncclShmem.groups[group].redOpArgs, postOp, Recv, 0, 0,
+             ncclShmem.groups[group].srcs,
              Dst, ncclShmem.groups[group].dsts,
              workSize);
         } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
@@ -377,18 +399,18 @@ class Primitives<
             reduceCopyPipelined<
               0, Recv + Src, Recv * MaxRecv + Src,
               0, 1, 1, PreOpSrcs>
-              (ncclShmem.groups[group].redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                1, ncclShmem.groups[group].dsts,
-                workSize);
+              (ncclShmem.groups[group].redOpArgs, postOp, Recv * fan.nrecv() + Src, Src, futureLocalElts,
+               ncclShmem.groups[group].srcs,
+               1, ncclShmem.groups[group].dsts,
+               workSize);
           } else {
             reduceCopyPipelined<
               MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
               MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
-              (ncclShmem.groups[group].redOpArgs, postOp,
-                Recv * fan.nrecv() + Src, ncclShmem.groups[group].srcs,
-                Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
-                workSize);
+              (ncclShmem.groups[group].redOpArgs, postOp, Recv * fan.nrecv() + Src, Src, futureLocalElts,
+               ncclShmem.groups[group].srcs,
+               Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+               workSize);
           }
         } else {
           // we will come here when calling prims.directSend with net peer,
