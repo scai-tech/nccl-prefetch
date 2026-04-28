@@ -156,15 +156,29 @@ class Primitives<
     #endif
   }
 
-  __device__ __forceinline__ void prefetchSimpleChunkRange(void** srcs, int srcBeg, int srcEnd, int chunkOffset, int chunkElts) {
+  __device__ __forceinline__ int simplePrefetchDedicatedThreads() const {
     #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
-    int prefetchThreads = nworkers < WARP_SIZE ? nworkers : WARP_SIZE;
-    if (!ncclShmem.comm.simpleL2PrefetchEnable || chunkElts <= 0 || tid >= prefetchThreads) return;
+    if (!ncclShmem.comm.simpleL2PrefetchEnable) return 0;
+    int extraThreads = nthreads - nworkers;
+    return extraThreads < WARP_SIZE ? 0 : WARP_SIZE;
+    #else
+    return 0;
+    #endif
+  }
+
+  __device__ __forceinline__ bool simplePrefetchUseWarpSpecialization() const {
+    return simplePrefetchDedicatedThreads() == WARP_SIZE;
+  }
+
+  __device__ __forceinline__ void prefetchSimpleChunkRangeIssued(
+      void** srcs, int srcBeg, int srcEnd, int chunkOffset, int chunkElts, int issuerTid, int issuerThreads) {
+    #if __CUDA_ARCH__ >= 900 && CUDART_VERSION >= 12010
+    if (!ncclShmem.comm.simpleL2PrefetchEnable || chunkElts <= 0 || issuerThreads <= 0 || issuerTid >= issuerThreads) return;
 
     size_t chunkBytes = size_t(chunkElts) * sizeof(T);
     if (chunkBytes < SimpleL2PrefetchMinBytes) return;
 
-    for (int s=srcBeg + tid; s < srcEnd; s += prefetchThreads) {
+    for (int s=srcBeg + issuerTid; s < srcEnd; s += issuerThreads) {
       if (srcs[s] == nullptr) continue;
       char* chunkStart = (char*)((T*)srcs[s] + chunkOffset);
       char* prefetchStart = alignUp(chunkStart, size_t(16));
@@ -182,17 +196,30 @@ class Primitives<
     (void)srcEnd;
     (void)chunkOffset;
     (void)chunkElts;
+    (void)issuerTid;
+    (void)issuerThreads;
     #endif
   }
 
-  __device__ __forceinline__ void prefetchSimpleCurrentChunks(void** srcs, int nSrcs, int nLocalSrcs, int chunkOffset, int chunkElts) {
+  __device__ __forceinline__ void prefetchSimpleChunkRange(void** srcs, int srcBeg, int srcEnd, int chunkOffset, int chunkElts) {
+    int prefetchThreads = nworkers < WARP_SIZE ? nworkers : WARP_SIZE;
+    prefetchSimpleChunkRangeIssued(srcs, srcBeg, srcEnd, chunkOffset, chunkElts, tid, prefetchThreads);
+  }
+
+  __device__ __forceinline__ void prefetchSimpleCurrentChunksIssued(
+      void** srcs, int nSrcs, int nLocalSrcs, int chunkOffset, int chunkElts, int issuerTid, int issuerThreads) {
     if (chunkElts <= 0) return;
     if (simplePrefetchLocalEnabled() && nLocalSrcs > 0) {
-      prefetchSimpleChunkRange(srcs, 0, nLocalSrcs, chunkOffset, chunkElts);
+      prefetchSimpleChunkRangeIssued(srcs, 0, nLocalSrcs, chunkOffset, chunkElts, issuerTid, issuerThreads);
     }
     if (simplePrefetchRecvEnabled() && nLocalSrcs < nSrcs) {
-      prefetchSimpleChunkRange(srcs, nLocalSrcs, nSrcs, chunkOffset, chunkElts);
+      prefetchSimpleChunkRangeIssued(srcs, nLocalSrcs, nSrcs, chunkOffset, chunkElts, issuerTid, issuerThreads);
     }
+  }
+
+  __device__ __forceinline__ void prefetchSimpleCurrentChunks(void** srcs, int nSrcs, int nLocalSrcs, int chunkOffset, int chunkElts) {
+    int prefetchThreads = nworkers < WARP_SIZE ? nworkers : WARP_SIZE;
+    prefetchSimpleCurrentChunksIssued(srcs, nSrcs, nLocalSrcs, chunkOffset, chunkElts, tid, prefetchThreads);
   }
 
   __device__ __forceinline__ void prefetchSimpleFutureLocalChunks(void** srcs, int nLocalSrcs, int chunkOffset, int chunkElts) {
@@ -264,6 +291,57 @@ class Primitives<
         RcMultimemSrcs, RcMinSrcs, RcMaxSrcs,
         RcMultimemDsts, RcMinDsts, RcMaxDsts, PreOpSrcs>
         (tid, nworkers, redArg, postOp, nSrcs, srcChunkPtrs, nDsts, dstChunkPtrs, chunkElts);
+    }
+  }
+
+  template<int RcMultimemSrcs, int RcMinSrcs, int RcMaxSrcs,
+           int RcMultimemDsts, int RcMinDsts, int RcMaxDsts, int PreOpSrcs>
+  __device__ __forceinline__ void reduceCopyWarpSpecialized(
+      uint64_t redArg, bool postOp, int nSrcs, int nLocalSrcs, int futureLocalElts,
+      void** srcs, int nDsts, void** dsts, int workSize
+    ) {
+    (void)futureLocalElts;
+    int chunkSize = simplePrefetchChunkSize(nSrcs, workSize);
+    int prefetchThreads = simplePrefetchDedicatedThreads();
+    if (chunkSize == 0 || prefetchThreads == 0) {
+      if (tid < nworkers) {
+        reduceCopy<Unroll, RedOp, T,
+          RcMultimemSrcs, RcMinSrcs, RcMaxSrcs,
+          RcMultimemDsts, RcMinDsts, RcMaxDsts, PreOpSrcs>
+          (tid, nworkers, redArg, postOp, nSrcs, srcs, nDsts, dsts, workSize);
+      }
+      return;
+    }
+
+    if (tid < nworkers) {
+      void* srcChunkPtrs[MaxRecv + 1];
+      void* dstChunkPtrs[MaxSend + 1];
+      for (int chunkOffset=0; chunkOffset < workSize; chunkOffset += chunkSize) {
+        int chunkElts = min(chunkSize, workSize-chunkOffset);
+        #pragma unroll
+        for (int s=0; s < MaxRecv + 1; s++) {
+          srcChunkPtrs[s] = s < nSrcs && srcs[s] != nullptr ? (T*)srcs[s] + chunkOffset : nullptr;
+        }
+        #pragma unroll
+        for (int d=0; d < MaxSend + 1; d++) {
+          dstChunkPtrs[d] = d < nDsts && dsts[d] != nullptr ? (T*)dsts[d] + chunkOffset : nullptr;
+        }
+        reduceCopy<Unroll, RedOp, T,
+          RcMultimemSrcs, RcMinSrcs, RcMaxSrcs,
+          RcMultimemDsts, RcMinDsts, RcMaxDsts, PreOpSrcs>
+          (tid, nworkers, redArg, postOp, nSrcs, srcChunkPtrs, nDsts, dstChunkPtrs, chunkElts);
+      }
+      return;
+    }
+
+    int prefetchTid = tid - nworkers;
+    if (prefetchTid >= prefetchThreads) return;
+
+    // Leave chunk 0 cold and use the extra warp to warm the remaining chunks
+    // while workers are already computing chunk 0.
+    for (int chunkOffset=chunkSize; chunkOffset < workSize; chunkOffset += chunkSize) {
+      int chunkElts = min(chunkSize, workSize-chunkOffset);
+      prefetchSimpleCurrentChunksIssued(srcs, nSrcs, nLocalSrcs, chunkOffset, chunkElts, prefetchTid, prefetchThreads);
     }
   }
 
@@ -370,7 +448,93 @@ class Primitives<
     int slice = 0;
     int offset = 0;
 
-    if (tid < nworkers && offset < nelem && !isNetOffload) {
+    bool useWarpSpecializedPrefetch = simplePrefetchUseWarpSpecialization() && offset < nelem && !isNetOffload;
+
+    if (useWarpSpecializedPrefetch) {
+      #if __CUDA_ARCH__ < 700
+        #pragma unroll SlicePerChunk
+      #else
+        #pragma unroll 1
+      #endif
+      do {
+        sliceSize = sliceSize < nelem-offset ? sliceSize : nelem-offset;
+        if (tid == 0) {
+          T* userInput = (T*)ncclShmem.groups[group].userInput;
+          T* userOutput = (T*)ncclShmem.groups[group].userOutput;
+          if (Src) ncclShmem.groups[group].srcs[0] = (SrcBuf==Input ? userInput : userOutput) + srcIx + offset;
+          if (Dst) ncclShmem.groups[group].dsts[0] = (DstBuf==Input ? userInput : userOutput) + dstIx + offset;
+        }
+        if (tid < nworkers) {
+          waitPeer<DirectRecv, DirectSend, Recv, Send, Src, Dst>(srcIx, dstIx, offset, sliceSize);
+          subBarrier();
+        }
+        /* if user abort the kernel, we don't need to actually perform copy/reduce; just set size
+         * to 0 to avoid unnecessary workload. */
+        int workSize = ncclShmem.aborted ? 0 : sliceSize;
+        if (flags & AnyNetDeviceUnpack) {
+          if (tid < nworkers) {
+            ncclNetDeviceUnpack<Recv>(tid, tidInBlock, nworkers, group, ncclShmem.groups[group].devicePlugin.unpack.unpackNetDeviceIndexMask, Src, workSize);
+            // Sync here to make sure all workers are reading from the updated srcs)
+            subBarrier();
+          }
+        }
+        int futureLocalElts = workSize == 0 ? 0 : max(0, nelem - (offset + workSize));
+
+        // Release the dedicated prefetch warp only once the current slice pointers
+        // are fully materialized in shared memory.
+        barrier();
+
+        if (DirectRecv && ncclShmem.groups[group].srcs[0] == ncclShmem.groups[group].dsts[0]
+            /* NVLS can have srcs[0] == dsts[0], but we cannot enter this "if branch",
+             * so we need to check whether MultimemSrcs and MultimemDsts are 0. */
+            && MultimemSrcs == 0 && MultimemDsts == 0 && !Src) {
+          // We can only have one direct receive. Since srcs[0] == dstPtr+offset, skip one copy
+          if (Send && Dst && ncclShmem.groups[group].srcs[0] != ncclShmem.groups[group].dsts[1]) {
+            reduceCopyWarpSpecialized<0, 1, 1, 0, 1, MaxSend, /*PreOpSrcs*/0>
+              (/*redArg*/0, /*postOp*/false, 1, 0, 0,
+               ncclShmem.groups[group].srcs,
+               fan.nsend(), ncclShmem.groups[group].dsts+1,
+               workSize);
+          }
+        } else if (DirectSend && !DirectRecv && SrcBuf != Input && ncclShmem.groups[group].dsts[Dst] == nullptr) {
+          // For broadcast in CollNet to do empty send
+          reduceCopyWarpSpecialized<0, 1, 1, 0, 1, 1, /*PreOpSrcs*/0>
+            (ncclShmem.groups[group].redOpArgs, postOp, Recv, 0, 0,
+             ncclShmem.groups[group].srcs,
+             Dst, ncclShmem.groups[group].dsts,
+             workSize);
+        } else if (ncclShmem.groups[group].srcs[0] && ncclShmem.groups[group].dsts[0]) {
+          constexpr int PreOpSrcs = SrcBuf != Input ? 0 : 1;
+          if (Send && Dst && ncclShmem.groups[group].dsts[1] == nullptr) {
+            // this case should only be directCopySend() with registered buffers and send to net peer
+            reduceCopyWarpSpecialized<
+              0, Recv + Src, Recv * MaxRecv + Src,
+              0, 1, 1, PreOpSrcs>
+              (ncclShmem.groups[group].redOpArgs, postOp, Recv * fan.nrecv() + Src, Src, futureLocalElts,
+               ncclShmem.groups[group].srcs,
+               1, ncclShmem.groups[group].dsts,
+               workSize);
+          } else {
+            reduceCopyWarpSpecialized<
+              MultimemSrcs, Recv + Src, Recv * MaxRecv + Src,
+              MultimemDsts, Send + Dst, Send * MaxSend + Dst, PreOpSrcs>
+              (ncclShmem.groups[group].redOpArgs, postOp, Recv * fan.nrecv() + Src, Src, futureLocalElts,
+               ncclShmem.groups[group].srcs,
+               Send * fan.nsend() + Dst, ncclShmem.groups[group].dsts,
+               workSize);
+          }
+        } else {
+          // we will come here when calling prims.directSend with net peer,
+          // in this case, ncclShmem.groups[group].dsts[0] == NULL, so we
+          // skip data flush.
+          workSize = 0;
+        }
+        barrier();
+        postPeer<Recv, Send>(0 < workSize);
+        offset += sliceSize;
+        slice += 1;
+      } while (slice < SlicePerChunk && offset < nelem);
+    } else if (tid < nworkers && offset < nelem && !isNetOffload) {
       // Worker-only loop for non-empty slices. Non-workers and empty slices are
       // processed in the loop following this if block. The benefit of splitting
       // the loop like this is we pull two branches out of the critical path.
